@@ -1,0 +1,3 @@
+[pynq.notebooks]
+balancin = balancin.notebooks
+
