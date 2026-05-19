@@ -1,0 +1,12 @@
+# Python build and distribution artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Byte-compiled Python files
+__pycache__/
+*.py[cod]
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
