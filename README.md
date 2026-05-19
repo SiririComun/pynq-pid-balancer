@@ -18,4 +18,4 @@ Open a terminal on your PYNQ board (connected to the internet) and execute the f
 ### 1. Install the Package via Pip
 Install the library and hardware binaries directly from this GitHub repository:
 ```bash
-pip3 install git+https://github.com/<your-github-username>/<your-repo-name>.git
+pip3 install git+https://github.com/SiririComun/pynq-pid-balancer.git
