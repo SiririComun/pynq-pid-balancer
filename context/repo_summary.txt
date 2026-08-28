@@ -1,0 +1,1027 @@
+==============================================================================
+⚙️  PROJECT ENVIRONMENT & TOOLCHAIN CONSTRAINTS
+==============================================================================
+• Repository State    : main @ ff36a3a
+• Package Version     : v1.0.0
+==============================================================================
+
+Git Context & Branch Topology:
+
+```log
+Current Branch: main | Working Tree: Dirty (3 modified/untracked files)
+
+Branch Tracking & Divergence Status:
+* main                ff36a3a [origin/main] Update README with updated installation
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/main ff36a3a Update README with updated installation
+
+Multi-Branch Git Commit Graph:
+* ff36a3a  (HEAD -> main, origin/main, origin/HEAD) - 2026-05-20 : Update README with updated installation (Juan Pablo Sanchez Arroyave)
+* 8ec7ca3  - 2026-05-19 : Update README with actual installation URL (SiririComun)
+* 9fcae67  - 2026-05-19 : Remove build artifacts and add .gitignore (SiririComun)
+* e2df9a9  - 2026-05-19 : Initial commit: PYNQ PID Balancer library and dashboard (SiririComun)
+```
+
+README.md: (README.md)
+
+```markdown
+# Balancin: Interactive PID Tuning Dashboard & Overlay
+
+This repository contains the complete PYNQ-based hardware-software integration for the Balancin self-balancing project. It packages the FPGA hardware overlay, custom device drivers, and an asynchronous graphical dashboard for real-time PID tuning.
+
+## Project Architecture
+
+*   **Hardware Fabric (PL):** Runs the custom PWM motor IP and the hardware I2C master.
+*   **Device Drivers (Python):** Custom classes (`MotorDriver` and `MPU6050Driver`) that extend PYNQ's base drivers to handle sensor physics (math formulas) and motor safety constraints (inverse logic).
+*   **Threaded Control Manager:** An asynchronous control manager (`Balancer`) that executes the PID math at a stable 50Hz in a background thread, preventing Jupyter kernel freezes.
+*   **Tuning Dashboard:** An interactive Jupyter interface featuring smooth real-time telemetry plots and dynamic gain sliders.
+
+---
+
+## Installation Guide (On PYNQ Board)
+
+Open a terminal on your PYNQ board (connected to the internet) and execute the following commands:
+
+### 1. Install the Package via Pip
+Install the library and hardware binaries directly from this GitHub repository:
+```bash
+pip3 install --no-build-isolation git+https://github.com/SiririComun/pynq-pid-balancer.git
+```
+
+__init__.py: (balancin/__init__.py)
+
+```python
+
+```
+
+balancer.py: (balancin/balancer.py)
+
+```python
+import threading
+import time
+from collections import deque
+from balancin.pid import PID
+
+class Balancer:
+    """
+    Main manager for the balancing logic.
+    Runs the PID loop in a background thread.
+    """
+    def __init__(self, overlay, kp=3.5, ki=0.0, kd=0.0):
+        self.ol = overlay
+        self.pid = PID(kp, ki, kd, out_min=-500, out_max=500)
+
+        # Control parameters
+        self.target_angle = 20.0  # The "Referencia"
+        self.base_pwm = 500       # The "PWM_BASE"
+
+        # Threading control
+        self.running = False
+        self._thread = None
+
+        # Add a rolling buffer for the last 100 samples
+        self.history = deque(maxlen=100)
+
+    def _loop(self):
+        last_time = time.perf_counter()
+        while self.running:
+            now = time.perf_counter()
+            dt = now - last_time
+            last_time = now
+
+            current_angle = self.ol.sensor.get_angle()
+            correction = self.pid.compute(self.target_angle, current_angle, dt)
+
+            self.ol.motor.set_speed(int(self.base_pwm + correction))
+
+            self.history.append((now, current_angle, self.target_angle))
+
+            time.sleep(0.02)
+
+    def start(self):
+        """Starts the background thread."""
+        if not self.running:
+            self.running = True
+            self.pid.reset()
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+            print("Balancer thread started.")
+
+    def stop(self):
+        """Safely stops the thread and the motor."""
+        self.running = False
+        if self._thread:
+            self._thread.join()
+        self.ol.motor.stop()
+        print("Balancer stopped and motor safety shutdown complete.")
+
+    def set_params(self, kp=None, ki=None, kd=None, target=None, base=None):
+        """Updates parameters in real-time while the thread is running."""
+        if kp is not None: self.pid.kp = kp
+        if ki is not None: self.pid.ki = ki
+        if kd is not None: self.pid.kd = kd
+        if target is not None: self.target_angle = target
+        if base is not None: self.base_pwm = base
+```
+
+drivers.py: (balancin/drivers.py)
+
+```python
+from pynq import DefaultIP
+from pynq.lib.iic import AxiIIC  # <--- Import the robust library
+import math
+import time
+
+class MotorDriver(DefaultIP):
+    # ... (Keep your MotorDriver exactly as it was, it works fine) ...
+    def __init__(self, description):
+        super().__init__(description)
+        self.stop()
+
+    def set_speed(self, value):
+        val = max(0, min(value, 1023))
+        hw_val = 1023 - val
+        self.write(0x00, hw_val)
+
+    def stop(self):
+        self.set_speed(0)
+
+MotorDriver.bindto = ['xilinx.com:ip:axi_gpio:2.0']
+
+class MPU6050Driver(AxiIIC): # <--- Inherit from AxiIIC, not DefaultIP
+    """
+    Custom Driver for MPU6050.
+    Inherits robust I2C logic from PYNQ and adds motion sensing methods.
+    """
+    def __init__(self, description):
+        super().__init__(description)
+        self._address = 0x68
+        self._setup_sensor()
+
+    def _setup_sensor(self):
+        # Wake up MPU6050 using the robust .send() method
+        self.send(self._address, bytes([0x6B, 0x00]), 2, 0)
+        time.sleep(0.1)
+
+    def read_word(self, reg):
+        # 1. Send register address (with repeated start option=1)
+        # Python 'bytes' is acceptable for sending
+        self.send(self._address, bytes([reg]), 1, 1)
+
+        # 2. Receive 2 bytes
+        # REPLACEMENT: We must use the CFFI 'ffi' object from AxiIIC
+        # to create a buffer that the underlying C driver can write to.
+        buf = AxiIIC._ffi.new("unsigned char[]", 2)
+        self.receive(self._address, buf, 2, 0)
+
+        # 3. Assemble and handle sign (Complement to 2)
+        # We can index 'buf' just like a normal list
+        value = (buf[0] << 8) | buf[1]
+        if value >= 0x8000:
+            value -= 65536
+        return value
+
+    def get_angle(self):
+        # Read and scale axes using the hardware team's formula
+        ax = self.read_word(0x3B) / 16384.0
+        ay = self.read_word(0x3D) / 16384.0
+        az = self.read_word(0x3F) / 16384.0
+
+        # atan2(x, sqrt(y^2 + z^2)) * 180 / PI
+        radians = math.atan2(ax, math.sqrt(ay**2 + az**2))
+        return math.degrees(radians)
+
+MPU6050Driver.bindto = ['xilinx.com:ip:axi_iic:2.1']
+```
+
+overlay.py: (balancin/overlay.py)
+
+```python
+import os
+from pynq import Overlay
+from balancin.drivers import MotorDriver, MPU6050Driver
+
+class BalancinOverlay(Overlay):
+    """
+    Custom Overlay class for the Balancin project.
+    Handles automatic bitstream loading and provides a clean API to the IPs.
+    """
+    def __init__(self, bitfile_name="balancin.bit", **kwargs):
+        # 1. Locate the bitstream relative to this file's location
+        # This allows the package to work after it is installed in /usr/local/
+        this_dir = os.path.dirname(__file__)
+        bitfile_path = os.path.join(this_dir, 'bitstreams', bitfile_name)
+
+        # 2. Initialize the base PYNQ Overlay
+        # This flashes the FPGA and parses the .hwh
+        super().__init__(bitfile_path, **kwargs)
+
+        # 3. Explicitly map our custom drivers
+        # We use the IP names from our Phase 0 discovery.
+        # This solves the "Priority" issue where PYNQ defaults to generic drivers.
+        self.motor = MotorDriver(self.ip_dict['axi_gpio_0'])
+        self.sensor = MPU6050Driver(self.ip_dict['axi_iic_0'])
+
+    def reset_hardware(self):
+        """Safety method to put the hardware in a known safe state."""
+        self.motor.stop()
+```
+
+pid.py: (balancin/pid.py)
+
+```python
+import time
+
+class PID:
+    """
+    Generic PID Controller.
+    Separates control logic from hardware communication.
+    """
+    def __init__(self, kp, ki, kd, out_min=0, out_max=1023):
+        # Gain constants
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+
+        # Output limits (PWM range)
+        self.out_min = out_min
+        self.out_max = out_max
+
+        # Internal state
+        self.integral = 0
+        self.last_error = 0
+
+    def compute(self, setpoint, measured_value, dt):
+        """
+        Calculates the PID output.
+        dt: The actual time elapsed since the last calculation.
+        """
+        # Calculate error
+        error = setpoint - measured_value
+
+        # Proportional term
+        p_term = self.kp * error
+
+        # Integral term with Anti-Windup
+        # We limit the integral so it doesn't grow to infinity if the motor is stuck
+        self.integral += error * dt
+        self.integral = max(min(self.integral, 200), -200) # Simple clamp
+        i_term = self.ki * self.integral
+
+        # Derivative term
+        # (Change in error / time)
+        d_term = self.kd * (error - self.last_error) / dt
+
+        # Total output
+        output = p_term + i_term + d_term
+
+        # Save state for next iteration
+        self.last_error = error
+
+        return output
+
+    def set_tunings(self, kp, ki, kd):
+        """Allows real-time updates of constants."""
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+
+    def reset(self):
+        """Clears memory of previous errors."""
+        self.integral = 0
+        self.last_error = 0
+```
+
+setup.py: (setup.py)
+
+```python
+import os
+import shutil
+from setuptools import setup, find_packages
+from pynq.utils import build_py
+
+module_name = "balancin"
+
+# 1. Automatically copy the user notebooks into the package for distribution
+if os.path.exists("notebooks"):
+    dest_dir = os.path.join(module_name, "notebooks")
+    if os.path.exists(dest_dir):
+        shutil.rmtree(dest_dir)
+    shutil.copytree("notebooks", dest_dir)
+
+# 2. Helper function to find all non-Python assets (bitstreams, hwh, notebooks)
+data_files = []
+def extend_package(path):
+    if os.path.isdir(path):
+        data_files.extend(
+            [os.path.join("..", root, f) for root, _, files in os.walk(path) for f in files]
+        )
+
+# Map the bitstreams and notebooks for setuptools packaging
+extend_package(os.path.join(module_name, "bitstreams"))
+extend_package(os.path.join(module_name, "notebooks"))
+
+# 3. Standard Setup configuration
+setup(
+    name=module_name,
+    version="1.0.0",
+    description="Real-time PID Balancer Overlay and Interactive Dashboard",
+    author="Pablo Sanchez & Software Team",
+    packages=find_packages(),
+    package_data={
+        "": data_files,
+    },
+    install_requires=[
+        "pynq>=2.7.0"
+    ],
+    entry_points={
+        "pynq.notebooks": [
+            "balancin = balancin.notebooks"
+        ]
+    },
+    cmdclass={"build_py": build_py}
+)
+```
+
+02_pid_tuning_dashboard.ipynb: (balancin/notebooks/02_pid_tuning_dashboard.ipynb)
+
+```python
+# %% [markdown] Cell 1
+# Balancin: Real-Time PID Tuning Dashboard
+# Welcome to the interactive tuning dashboard for the Balancin project.
+# This environment allows you to tune the Proportional, Integral, and Derivative ($K_p$, $K_i$, $K_d$) constants of the system in real-time.
+### 1. System Initialization
+# Run the cell below to load the FPGA bitstream, map the custom hardware drivers, and initialize the background control manager.<
+
+# %% [code] Cell 2 [In 1]
+#import sys
+#import os
+
+### Add the correct absolute path of the project to the Python search path
+#sys.path.append('/home/xilinx/jupyter_notebooks/PabloSanchez/pwm/Overlay')
+
+from balancin.overlay import BalancinOverlay
+from balancin.balancer import Balancer
+
+# Load the FPGA bitstream (the BalancinOverlay class automatically finds the bitstream file now)
+ol = BalancinOverlay()
+
+# Initialize the threaded PID manager (defaulting to safe starting values)
+bal = Balancer(ol, kp=3.5, ki=0.0, kd=0.0)
+
+print("Hardware loaded and Balancer initialized successfully.")
+print("Waiting for control panel launch...")
+
+# %% [markdown] Cell 3
+### 2. Control Panel Configuration
+# Below we configure the graphical interface for the tuning parameters.
+# - **Sliders:** Allow real-time adjustment of the PID constants and the target angle.
+# - **Controls:** Safely start and stop the hardware control thread.
+# *(Note: This cell initializes the layout in memory. The actual interface will be rendered in the final dashboard view).*
+
+# %% [code] Cell 4 [In 2]
+import ipywidgets as widgets
+
+# --- 1. Style and Layout Definitions ---
+# This ensures all sliders line up perfectly and look professional
+widget_style = {'description_width': '100px'}
+widget_layout = widgets.Layout(width='400px')
+
+# --- 2. Create the Sliders ---
+kp_slider = widgets.FloatSlider(value=3.5, min=0.0, max=20.0, step=0.1, 
+                                description='Kp (Prop):', style=widget_style, layout=widget_layout)
+ki_slider = widgets.FloatSlider(value=0.0, min=0.0, max=10.0, step=0.01, 
+                                description='Ki (Integ):', style=widget_style, layout=widget_layout)
+kd_slider = widgets.FloatSlider(value=0.0, min=0.0, max=5.0, step=0.01, 
+                                description='Kd (Deriv):', style=widget_style, layout=widget_layout)
+target_slider = widgets.FloatSlider(value=20.0, min=-45.0, max=45.0, step=1.0, 
+                                    description='Target Angle:', style=widget_style, layout=widget_layout)
+
+# --- 3. Create the Buttons ---
+btn_start = widgets.Button(description='Start Motor', button_style='success', icon='play', layout=widgets.Layout(width='195px'))
+btn_stop = widgets.Button(description='Stop Motor', button_style='danger', icon='stop', layout=widgets.Layout(width='195px'))
+
+# --- 4. Define Callbacks ---
+def on_slider_change(change):
+    # Push the new values directly into the running thread
+    bal.set_params(
+        kp=kp_slider.value,
+        ki=ki_slider.value,
+        kd=kd_slider.value,
+        target=target_slider.value
+    )
+
+def on_start_clicked(b):
+    bal.start()
+
+def on_stop_clicked(b):
+    bal.stop()
+
+# --- 5. Attach Callbacks ---
+kp_slider.observe(on_slider_change, names='value')
+ki_slider.observe(on_slider_change, names='value')
+kd_slider.observe(on_slider_change, names='value')
+target_slider.observe(on_slider_change, names='value')
+
+btn_start.on_click(on_start_clicked)
+btn_stop.on_click(on_stop_clicked)
+
+# --- 6. Group into a Layout ---
+button_box = widgets.HBox([btn_start, btn_stop])
+control_panel = widgets.VBox([
+    widgets.HTML("<b>PID Tuning Parameters</b>"),
+    kp_slider, ki_slider, kd_slider, 
+    widgets.HTML("<hr><b>Reference Control</b>"),
+    target_slider,
+    widgets.HTML("<br>"),
+    button_box
+])
+
+print("Control panel layout configured.")
+
+# %% [markdown] Cell 5
+### 3. Telemetry Plot Configuration
+# To monitor the step response and stability of the PID controller, we configure a live telemetry plot.
+# This plot uses dynamic data updating (rather than full canvas redraws) to provide a smooth, flicker-free visualization of the hardware's behavior over time.
+
+# %% [code] Cell 6 [In 3]
+import matplotlib.pyplot as plt
+
+# --- 1. Create the Figure and Axes ---
+fig, ax = plt.subplots(figsize=(8, 4))
+
+# --- 2. Initialize Empty Lines ---
+# By saving these line objects to variables, we can inject new data into them later
+line_angle, = ax.plot([], [], label='Current Angle', color='blue', lw=2)
+line_target, = ax.plot([], [], label='Target', linestyle='--', color='red', lw=2)
+
+# --- 3. Configure Plot Aesthetics ---
+ax.set_ylim(-45, 45)       # Fixed Y-axis for stability
+ax.set_xlim(0, 10)         # Initial X-axis window
+ax.set_xlabel('Time (s)')
+ax.set_ylabel('Angle (°)')
+ax.set_title('Live System Telemetry')
+ax.legend(loc='upper right')
+ax.grid(True, linestyle=':', alpha=0.7)
+
+# --- 4. Prevent Immediate Rendering ---
+# We close the static plot here so we can display it dynamically in our custom layout
+plt.close(fig)
+
+print("Telemetry plot layout configured.")
+
+# %% [markdown] Cell 7
+### 4. Launch Unified Dashboard
+# The block below launches the complete tuning interface.
+# **Instructions:**
+# 1. Click **Start Motor** to engage the hardware loop.
+# 2. Use the sliders to tune the PID response in real-time.
+# 3. The graph will update automatically to show the system's step response.
+# 4. To safely exit the tuning mode, click **Stop Motor** and interrupt the Jupyter cell (the Stop button ◼️ in the toolbar).
+
+# %% [code] Cell 8 [In 4]
+import asyncio
+from IPython.display import display, clear_output
+
+# --- 1. Create a dedicated output area for the plot ---
+plot_output = widgets.Output()
+
+# --- 2. Assemble the Layout ---
+# Place the control panel on the left, and the plot on the right
+dashboard = widgets.HBox([control_panel, plot_output])
+
+# Render the interface
+display(dashboard)
+
+# --- 3. The Non-Blocking Live UI Update Loop ---
+# Using asyncio allows Jupyter's event loop to process widget clicks and sliders
+async def update_plot():
+    try:
+        while True:
+            # Check if the background thread has collected data
+            if len(bal.history) >= 2:
+                # Extract data from the deque safely
+                data = list(bal.history)
+                times = [d[0] - data[0][0] for d in data] # Normalize start time to 0
+                angles = [d[1] for d in data]
+                targets = [d[2] for d in data]
+                
+                # Update the lines with new data (highly efficient)
+                line_angle.set_data(times, angles)
+                line_target.set_data(times, targets)
+                
+                # Scroll the X-axis to keep the last 10 seconds in view
+                current_time = times[-1]
+                ax.set_xlim(max(0, current_time - 10), max(10, current_time))
+                
+                # Push the updated figure to the output container
+                with plot_output:
+                    clear_output(wait=True)
+                    display(fig)
+                    
+            # Yield control back to Jupyter so widgets stay responsive (10 FPS)
+            await asyncio.sleep(0.1)
+            
+    except asyncio.CancelledError:
+        print("Dashboard display loop halted.")
+
+# Stop any previous plot task if the cell is run multiple times
+try:
+    plot_task.cancel()
+except NameError:
+    pass
+
+# Start the async loop without blocking the cell
+plot_task = asyncio.create_task(update_plot())
+
+```
+
+02_pid_tuning_dashboard.ipynb: (notebooks/02_pid_tuning_dashboard.ipynb)
+
+```python
+# %% [markdown] Cell 1
+# Balancin: Real-Time PID Tuning Dashboard
+# Welcome to the interactive tuning dashboard for the Balancin project.
+# This environment allows you to tune the Proportional, Integral, and Derivative ($K_p$, $K_i$, $K_d$) constants of the system in real-time.
+### 1. System Initialization
+# Run the cell below to load the FPGA bitstream, map the custom hardware drivers, and initialize the background control manager.<
+
+# %% [code] Cell 2 [In 1]
+import sys
+import os
+
+# Add the correct absolute path of the project to the Python search path
+sys.path.append('/home/xilinx/jupyter_notebooks/PabloSanchez/pwm/Overlay')
+
+from balancin.overlay import BalancinOverlay
+from balancin.balancer import Balancer
+
+# Load the FPGA bitstream (the BalancinOverlay class automatically finds the bitstream file now)
+ol = BalancinOverlay()
+
+# Initialize the threaded PID manager (defaulting to safe starting values)
+bal = Balancer(ol, kp=3.5, ki=0.0, kd=0.0)
+
+print("Hardware loaded and Balancer initialized successfully.")
+print("Waiting for control panel launch...")
+
+# %% [markdown] Cell 3
+### 2. Control Panel Configuration
+# Below we configure the graphical interface for the tuning parameters.
+# - **Sliders:** Allow real-time adjustment of the PID constants and the target angle.
+# - **Controls:** Safely start and stop the hardware control thread.
+# *(Note: This cell initializes the layout in memory. The actual interface will be rendered in the final dashboard view).*
+
+# %% [code] Cell 4 [In 2]
+import ipywidgets as widgets
+
+# --- 1. Style and Layout Definitions ---
+# This ensures all sliders line up perfectly and look professional
+widget_style = {'description_width': '100px'}
+widget_layout = widgets.Layout(width='400px')
+
+# --- 2. Create the Sliders ---
+kp_slider = widgets.FloatSlider(value=3.5, min=0.0, max=20.0, step=0.1, 
+                                description='Kp (Prop):', style=widget_style, layout=widget_layout)
+ki_slider = widgets.FloatSlider(value=0.0, min=0.0, max=10.0, step=0.01, 
+                                description='Ki (Integ):', style=widget_style, layout=widget_layout)
+kd_slider = widgets.FloatSlider(value=0.0, min=0.0, max=5.0, step=0.01, 
+                                description='Kd (Deriv):', style=widget_style, layout=widget_layout)
+target_slider = widgets.FloatSlider(value=20.0, min=-45.0, max=45.0, step=1.0, 
+                                    description='Target Angle:', style=widget_style, layout=widget_layout)
+
+# --- 3. Create the Buttons ---
+btn_start = widgets.Button(description='Start Motor', button_style='success', icon='play', layout=widgets.Layout(width='195px'))
+btn_stop = widgets.Button(description='Stop Motor', button_style='danger', icon='stop', layout=widgets.Layout(width='195px'))
+
+# --- 4. Define Callbacks ---
+def on_slider_change(change):
+    # Push the new values directly into the running thread
+    bal.set_params(
+        kp=kp_slider.value,
+        ki=ki_slider.value,
+        kd=kd_slider.value,
+        target=target_slider.value
+    )
+
+def on_start_clicked(b):
+    bal.start()
+
+def on_stop_clicked(b):
+    bal.stop()
+
+# --- 5. Attach Callbacks ---
+kp_slider.observe(on_slider_change, names='value')
+ki_slider.observe(on_slider_change, names='value')
+kd_slider.observe(on_slider_change, names='value')
+target_slider.observe(on_slider_change, names='value')
+
+btn_start.on_click(on_start_clicked)
+btn_stop.on_click(on_stop_clicked)
+
+# --- 6. Group into a Layout ---
+button_box = widgets.HBox([btn_start, btn_stop])
+control_panel = widgets.VBox([
+    widgets.HTML("<b>PID Tuning Parameters</b>"),
+    kp_slider, ki_slider, kd_slider, 
+    widgets.HTML("<hr><b>Reference Control</b>"),
+    target_slider,
+    widgets.HTML("<br>"),
+    button_box
+])
+
+print("Control panel layout configured.")
+
+# %% [markdown] Cell 5
+### 3. Telemetry Plot Configuration
+# To monitor the step response and stability of the PID controller, we configure a live telemetry plot.
+# This plot uses dynamic data updating (rather than full canvas redraws) to provide a smooth, flicker-free visualization of the hardware's behavior over time.
+
+# %% [code] Cell 6 [In 3]
+import matplotlib.pyplot as plt
+
+# --- 1. Create the Figure and Axes ---
+fig, ax = plt.subplots(figsize=(8, 4))
+
+# --- 2. Initialize Empty Lines ---
+# By saving these line objects to variables, we can inject new data into them later
+line_angle, = ax.plot([], [], label='Current Angle', color='blue', lw=2)
+line_target, = ax.plot([], [], label='Target', linestyle='--', color='red', lw=2)
+
+# --- 3. Configure Plot Aesthetics ---
+ax.set_ylim(-45, 45)       # Fixed Y-axis for stability
+ax.set_xlim(0, 10)         # Initial X-axis window
+ax.set_xlabel('Time (s)')
+ax.set_ylabel('Angle (°)')
+ax.set_title('Live System Telemetry')
+ax.legend(loc='upper right')
+ax.grid(True, linestyle=':', alpha=0.7)
+
+# --- 4. Prevent Immediate Rendering ---
+# We close the static plot here so we can display it dynamically in our custom layout
+plt.close(fig)
+
+print("Telemetry plot layout configured.")
+
+# %% [markdown] Cell 7
+### 4. Launch Unified Dashboard
+# The block below launches the complete tuning interface.
+# **Instructions:**
+# 1. Click **Start Motor** to engage the hardware loop.
+# 2. Use the sliders to tune the PID response in real-time.
+# 3. The graph will update automatically to show the system's step response.
+# 4. To safely exit the tuning mode, click **Stop Motor** and interrupt the Jupyter cell (the Stop button ◼️ in the toolbar).
+
+# %% [code] Cell 8 [In 4]
+import asyncio
+from IPython.display import display, clear_output
+
+# --- 1. Create a dedicated output area for the plot ---
+plot_output = widgets.Output()
+
+# --- 2. Assemble the Layout ---
+# Place the control panel on the left, and the plot on the right
+dashboard = widgets.HBox([control_panel, plot_output])
+
+# Render the interface
+display(dashboard)
+
+# --- 3. The Non-Blocking Live UI Update Loop ---
+# Using asyncio allows Jupyter's event loop to process widget clicks and sliders
+async def update_plot():
+    try:
+        while True:
+            # Check if the background thread has collected data
+            if len(bal.history) >= 2:
+                # Extract data from the deque safely
+                data = list(bal.history)
+                times = [d[0] - data[0][0] for d in data] # Normalize start time to 0
+                angles = [d[1] for d in data]
+                targets = [d[2] for d in data]
+                
+                # Update the lines with new data (highly efficient)
+                line_angle.set_data(times, angles)
+                line_target.set_data(times, targets)
+                
+                # Scroll the X-axis to keep the last 10 seconds in view
+                current_time = times[-1]
+                ax.set_xlim(max(0, current_time - 10), max(10, current_time))
+                
+                # Push the updated figure to the output container
+                with plot_output:
+                    clear_output(wait=True)
+                    display(fig)
+                    
+            # Yield control back to Jupyter so widgets stay responsive (10 FPS)
+            await asyncio.sleep(0.1)
+            
+    except asyncio.CancelledError:
+        print("Dashboard display loop halted.")
+
+# Stop any previous plot task if the cell is run multiple times
+try:
+    plot_task.cancel()
+except NameError:
+    pass
+
+# Start the async loop without blocking the cell
+plot_task = asyncio.create_task(update_plot())
+
+```
+
+00_hardware_exploration.ipynb: (test/00_hardware_exploration.ipynb)
+
+```python
+# %% [markdown] Cell 1
+# Phase 0: Hardware Exploration
+# **Step 1: Loading the Bitstream and Understanding the HWH File**
+# In traditional FPGA development, software engineers have to manually hardcode physical memory addresses to talk to the hardware (e.g., `0x41200000`).
+# PYNQ changes this entirely by using the **`.hwh` (Hardware Handoff) file**. When the hardware team compiles the Vivado project, Vivado generates this XML-based file. It contains the complete schematic of the FPGA design, including all IP blocks, their memory addresses, interrupts, and clock frequencies.
+# When we load the `.bit` file using `pynq.Overlay`, PYNQ secretly looks for a `.hwh` file with the exact same name, parses it, and dynamically creates a Python dictionary mapping the entire hardware architecture. Let's load the hardware into the Programmable Logic (PL).
+
+# %% [code] Cell 2 [In 2]
+from pynq import Overlay
+
+# This command flashes the FPGA Programmable Logic (PL) with the bitstream
+# AND parses the balancin.hwh file to build the system architecture in Python.
+ol = Overlay("balancin.bit")
+
+print("Bitstream loaded and HWH parsed successfully!")
+
+# %% [markdown] Cell 3
+# To verify that the PL (Programmable Logic) was successfully programmed, we can query the overlay's status.
+
+# %% [code] Cell 4 [In 3]
+# Verify the bitstream is currently active on the FPGA
+is_flashed = ol.is_loaded()
+print(f"Is the FPGA programmed with our design? {is_flashed}")
+
+# %% [markdown] Cell 5
+# **Step 2: Interrogating the IP Dictionary**
+# Because PYNQ parsed the `.hwh` file, it constructed a master dictionary of every intellectual property (IP) core present in the Programmable Logic.
+# Instead of relying on a hardware schematic (like a Vivado PDF), we can dynamically ask the FPGA what hardware blocks are available to us as software engineers.
+
+# %% [code] Cell 6 [In 7]
+# List the names of all the hardware blocks discovered in the FPGA
+ip_names = list(ol.ip_dict.keys())
+print("Discovered IP Blocks:")
+for name in ip_names:
+    print(f"- {name}")
+
+# %% [markdown] Cell 7
+# You should see names like `axi_gpio_0` (which we suspect is the motor) and `axi_iic_0` (which we suspect is the MPU6050 sensor).
+# However, just knowing the names isn't enough. To communicate with these blocks, the CPU needs to know their **Physical Memory Address**. In a Zynq chip, the hardware is memory-mapped. This means that writing a number to a specific physical memory address doesn't save it to RAM; instead, it sends an electrical signal directly to the hardware pins!
+# Let's write a loop to extract the Name, Physical Address, and the Xilinx IP Type for everything in our system.
+
+# %% [code] Cell 8 [In 9]
+# Create a nicely formatted table of our hardware map
+print(f"{'IP Block Name':<20} | {'Physical Address':<18} | {'Xilinx IP Type'}")
+print("-" * 75)
+
+for name, info in ol.ip_dict.items():
+    # Safely extract physical address using .get() to avoid KeyError on IPs without memory mapping
+    addr = info.get('phys_addr')
+    phys_addr = hex(addr) if addr is not None else "N/A"
+    
+    # Safely extract the standard Xilinx type identifier
+    ip_type = info.get('type', 'N/A')
+    
+    print(f"{name:<20} | {phys_addr:<18} | {ip_type}")
+
+# %% [markdown] Cell 9
+# **Step 3: Inspecting the Register Map (AXI GPIO)**
+# We know the `axi_gpio_0` block lives at the physical address `0x41200000`. But what exactly is at that address?
+# Hardware blocks use **Registers** (small memory slots) to receive commands and data.
+# Instead of guessing or reading a 100-page Xilinx datasheet, we can ask PYNQ to generate an interactive map of the GPIO's internal registers.
+
+# %% [code] Cell 10 [In 10]
+# Access the specific IP block
+gpio_ip = ol.axi_gpio_0
+
+# Display the interactive register map
+# In Jupyter, this will render as a nice readable table
+gpio_ip.register_map
+
+# %% [markdown] Cell 11
+# When you run the cell above, you should see a table of registers. Pay attention to two specific registers:
+# 1. **`Channel_1_DATA`** (Usually at offset `0x00`): This is where the actual value (0 to 1023 for your PWM) is stored.
+# 2. **`Channel_1_TRI`** (Usually at offset `0x04`): This is the "Tri-state" or direction register. It tells the hardware if the pins are Inputs (1) or Outputs (0).
+# To send a PWM signal to the motor, we need to make sure the direction is set to Output, and then write a number into the DATA register. PYNQ's `register_map` allows us to interact with these registers by name!
+
+# %% [code] Cell 12 [In 13]
+# Let's read the current state of the Channel 1 Data Register
+current_data = gpio_ip.register_map.GPIO_DATA
+print(f"Current value in GPIO_DATA register: {current_data}")
+
+# Let's read the Tri-state (Direction) register
+current_dir = gpio_ip.register_map.GPIO_TRI
+print(f"Current value in GPIO_TRI (Direction) register: {hex(current_dir)}")
+
+# %% [markdown] Cell 13
+# **Step 4: Raw Memory-Mapped I/O (MMIO) Control**
+# Every "High-Level" driver in PYNQ (like `AxiGPIO`) is actually just a wrapper around a lower-level class called **`MMIO`**.
+# As a software engineer, you can think of the FPGA as a block of RAM.
+# - The **Base Address** (which we found in Step 2: `0x41200000`) is the start of the hardware block.
+# - The **Offsets** are the specific "slots" within that block.
+# For the AXI GPIO:
+# - Offset `0x00`: The Data Register (`GPIO_DATA`)
+# - Offset `0x04`: The Tri-state Register (`GPIO_TRI`)
+# Let's use the `MMIO` class to physically configure the pins as outputs and send a pulse to the motor.
+
+# %% [code] Cell 14 [In 14]
+from pynq import MMIO
+
+# Define the physical address we discovered earlier
+GPIO_BASE_ADDR = 0x41200000
+ADDRESS_RANGE = 0x10  # We only need 16 bytes of space
+
+# Initialize the MMIO object
+# This maps the physical hardware memory into our Python process
+motor_mmio = MMIO(GPIO_BASE_ADDR, ADDRESS_RANGE)
+
+print("MMIO Link established with the hardware.")
+
+# %% [markdown] Cell 15
+# Now, let's perform the "Bare Metal" sequence to spin the motor:
+# 1. **Set Direction:** Write `0` to offset `0x04`. In GPIO, a `0` means "Output" and a `1` means "Input".
+# 2. **Write Value:** Write a number between `0` and `1023` to offset `0x00`.
+# *Safety Note: We will write a small value first (200) to ensure the motor doesn't jump too hard.*
+
+# %% [code] Cell 16 [In 17]
+# 1. Set the Tri-state register to 0 (All pins as Output)
+motor_mmio.write(0x04, 0x0)
+
+# 2. Write a PWM value to the Data register (Offset 0x00)
+# Let's write 500 (roughly 50% power if max is 1023)
+motor_mmio.write(0x00, 500)
+
+print("Value 500 written to physical memory. Check your motor!")
+
+# %% [code] Cell 17 [In 20]
+# To turn the motor off, write 0 to the data offset
+motor_mmio.write(0x00, 1023)
+print("Motor stopped.")
+
+# %% [markdown] Cell 18
+# **Step 5: Discovering the Sensor Interface (AXI IIC)**
+# The motor is controlled by a simple GPIO (General Purpose Input/Output), but the **MPU6050 IMU** (Inertial Measurement Unit) is more complex.
+# In our hardware discovery (Step 2), we found a block called `axi_iic_0` at address `0x41600000`. Unlike the GPIO, which just holds a number, this I2C controller has a "FIFO" (First-In-First-Out) buffer. To talk to the sensor, we have to:
+# 1. Write the sensor's address (`0x68`) to the I2C controller.
+# 2. Write the register we want to read (like the Accelerometer Z-axis) into the controller's transmit buffer.
+# 3. Tell the controller to start the electrical transaction on the physical wires.
+# Let's look at the register map of this controller to see how it differs from the GPIO.
+
+# %% [code] Cell 19 [In 21]
+# Access the I2C IP block
+i2c_ip = ol.axi_iic_0
+
+# Display the register map
+i2c_ip.register_map
+
+# %% [markdown] Cell 20
+# Looking at the `register_map` for `axi_iic_0`, you will see much more complex registers:
+# * **`DGIER` / `IPIER`**: Interrupt controllers (used for high-speed sensor timing).
+# * **`TX_FIFO`**: Where we "drop" data we want to send to the MPU6050.
+# * **`RX_FIFO`**: Where the data coming back from the sensor is stored.
+# * **`CR` (Control Register)**: The "Command Center" where we tell the hardware to START or STOP the I2C transaction.
+# **Conclusion of Phase 0:**
+# We have successfully:
+# 1. Verified the hardware is alive.
+# 2. Discovered the memory addresses (`0x41200000` and `0x41600000`).
+# 3. Verified the register structure.
+# 4. Discovered the **Inverse Logic** of the motor.
+# We are now ready to leave the "Exploration" phase and move to **Phase 1: Encapsulation**, where we will write professional Python classes so we never have to think about these raw memory addresses again.
+
+```
+
+01_verification_test.ipynb: (test/01_verification_test.ipynb)
+
+```python
+# %% [markdown] Cell 1
+# Phase 2: System Verification
+# **Testing the Threaded Balancer and Custom Overlay**
+# Now that we have encapsulated the hardware, the math, and the threading logic into our `balancin` library, we can interact with the hardware using a clean, professional API.
+# The most important feature here is **Concurrency**. Because the PID loop is running in a background thread, this notebook will remain responsive.
+
+# %% [code] Cell 2 [In 1]
+from balancin.overlay import BalancinOverlay
+from balancin.balancer import Balancer
+import time
+
+# 1. Load the hardware (Drivers are mapped automatically now!)
+ol = BalancinOverlay()
+
+# 2. Initialize the manager
+# We start with the constants from the original hardware notebook
+bal = Balancer(ol, kp=3.5, ki=0.0, kd=0.0)
+
+print("System ready.")
+
+# %% [markdown] Cell 3
+### Starting the Balancer
+# When you run the cell below, the PID loop will start. You should hear the motor start to react to the sensor angle.
+# **Note:** The cell will finish executing immediately, but the motor will keep running in the background!
+
+# %% [code] Cell 4 [In 2]
+bal.target_angle = 20.0 # Set the desired angle
+bal.start()
+
+# %% [markdown] Cell 5
+### Real-Time Interaction
+# While the motor is running, run the cell below.
+
+# %% [code] Cell 6 [In 3]
+# Change Kp and the target angle on the fly
+print("Increasing Kp to 5.0 and changing target to 15 degrees...")
+bal.set_params(kp=5.0, target=15.0)
+
+# Wait a bit to observe
+time.sleep(3)
+
+print("Returning to original settings...")
+bal.set_params(kp=3.5, target=20.0)
+
+# %% [markdown] Cell 7
+### Safe Shutdown
+# Finally, we stop the thread. Our `balancer.stop()` method is designed to join the thread and immediately send a stop signal to the motor.
+
+# %% [code] Cell 8 [In 4]
+bal.stop()
+
+```
+
+test_drivers.ipynb: (test/test_drivers.ipynb)
+
+```python
+# %% [markdown] Cell 1
+## Step 4: Driver Verification
+# Now that we have encapsulated the hardware logic into the `MotorDriver` and `MPU6050Driver` classes, we will test the **Automatic Mapping** feature of PYNQ.
+# If our `bindto` strings were correct, PYNQ will no longer treat the IPs as generic memory blocks; it will treat them as our custom Python objects.
+
+# %% [code] Cell 2 [In 1]
+from pynq import Overlay
+from balancin.drivers import MotorDriver, MPU6050Driver
+
+# 1. Load the overlay
+ol = Overlay("balancin/bitstreams/balancin.bit")
+
+# 2. MANUALLY OVERRIDE the default drivers with your custom ones
+# We pass the IP's metadata (from ol.ip_dict) to our class constructors
+ol.axi_gpio_0 = MotorDriver(ol.ip_dict['axi_gpio_0'])
+ol.axi_iic_0 = MPU6050Driver(ol.ip_dict['axi_iic_0'])
+
+# 3. Verify the types again - they should now show your custom classes
+print(f"Type of axi_gpio_0: {type(ol.axi_gpio_0)}")
+print(f"Type of axi_iic_0: {type(ol.axi_iic_0)}")
+
+# %% [code] Cell 3 [In 2]
+# Test the sensor
+angle = ol.axi_iic_0.get_angle()
+print(f"Current sensor angle: {angle:.2f} degrees")
+
+# Test the motor using our new scale (0 is stop, 1023 is max)
+# Remember: The driver handles the inverse logic for us!
+print("Starting motor at speed 200...")
+ol.axi_gpio_0.set_speed(200)
+
+import time
+time.sleep(2)
+
+print("Stopping motor...")
+ol.axi_gpio_0.stop()
+
+# %% [code] Cell 4 [In 1]
+from balancin.overlay import BalancinOverlay
+ol = BalancinOverlay()
+
+print(f"Motor class: {type(ol.motor)}")
+print(f"Sensor class: {type(ol.sensor)}")
+
+# Verify it actually works
+print(f"Current angle: {ol.sensor.get_angle()}")
+
+# %% [code] Cell 5 [In 5]
+from balancin.pid import PID
+
+# Test: If error is 10 and Kp is 2, output should be 20
+test_pid = PID(kp=2.0, ki=0, kd=0)
+result = test_pid.compute(setpoint=20, measured_value=10, dt=0.02)
+print(f"PID Test Result: {result}") # Should be 20.0
+
+# %% [code] Cell 6 [In 7]
+from balancin.overlay import BalancinOverlay
+from balancin.balancer import Balancer
+
+ol = BalancinOverlay()
+bal = Balancer(ol)
+
+# This returns immediately!
+bal.start()
+
+# You can now change things while it runs:
+bal.set_params(kp=4.2) 
+
+# Stop it when you are done
+bal.stop()
+
+```
